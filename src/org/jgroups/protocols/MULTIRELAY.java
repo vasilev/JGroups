@@ -29,11 +29,11 @@ import java.util.concurrent.TimeUnit;
  * [1] https://jira.jboss.org/browse/JGRP-747<p/>
  * [2] doc/design/RELAY.txt
  *
- * @author Bela Ban
- * @since 2.12
+ * @author Bela Ban (original RELAY.java)
+ * @author vasilev@Namba
  */
 @Experimental
-@MBean(description="RELAY protocol")
+@MBean(description="MULTIRELAY protocol")
 public class MULTIRELAY extends Protocol {
 
     /* ------------------------------------------    Properties     ---------------------------------------------- */
@@ -41,11 +41,15 @@ public class MULTIRELAY extends Protocol {
       "should be short. This is a mandatory property and must be set",writable=false)
     protected String site;
 
-    @Property(description="Properties of the bridge cluster (e.g. tcp.xml)")
+    @Property(description="Properties of the bridge cluster (e.g. bridge.xml)")
     protected String bridge_props=null;
+    @Property(description="Properties of the bridge2 cluster (e.g. bridge2.xml)")
+    protected String bridge_props2=null;
 
     @Property(description="Name of the bridge cluster")
     protected String bridge_name="bridge-cluster";
+    @Property(description="Name of the bridge2 cluster")
+    protected String bridge_name2="bridge-cluster2";
 
     // @Property(description="If true, messages are relayed asynchronously, ie. via submission of a task to the timer thread pool")
     // protected boolean async=false;
@@ -68,6 +72,7 @@ public class MULTIRELAY extends Protocol {
 
     /** The bridge between the two local clusters, usually based on a TCP config */
     protected JChannel         bridge;
+    protected JChannel         bridge2;
 
     /** The view of the local cluster */
     protected View             local_view;
@@ -87,6 +92,7 @@ public class MULTIRELAY extends Protocol {
     protected TimeScheduler    timer;
 
     protected Future<?>        remote_view_fetcher_future;
+    protected Future<?>        remote_view_fetcher_future2;
 
 
 
@@ -136,6 +142,7 @@ public class MULTIRELAY extends Protocol {
     public void stop() {
         stopRemoteViewFetcher();
         Util.close(bridge);
+        Util.close(bridge2);
     }
 
     public Object down(Event evt) {
@@ -160,6 +167,7 @@ public class MULTIRELAY extends Protocol {
 
             case Event.DISCONNECT:
                 Util.close(bridge);
+                Util.close(bridge2);
                 break;
 
             case Event.SET_LOCAL_ADDRESS:
@@ -251,8 +259,10 @@ public class MULTIRELAY extends Protocol {
                 if(log.isTraceEnabled())
                     log.trace("I'm not coordinator anymore, closing the channel");
                 Util.close(bridge);
+                Util.close(bridge2);
                 is_coord=false;
                 bridge=null;
+                bridge2=null;
             }
         }
         else if(is_new_coord)
@@ -303,6 +313,14 @@ public class MULTIRELAY extends Protocol {
             }
             catch(Throwable t) {
                 log.error("failed forwarding message over bridge", t);
+            }
+        }
+        if(bridge2 != null) {
+            try {
+                bridge2.send(msg);
+            }
+            catch(Throwable t) {
+                log.error("failed forwarding message over bridge2", t);
             }
         }
     }
@@ -359,6 +377,30 @@ public class MULTIRELAY extends Protocol {
         catch(Exception e) {
             log.error("failed sending view to remote", e);
         }
+        try {
+            if(bridge2 != null && bridge2.isConnected()) {
+                byte[] buf=Util.streamableToByteBuffer(view_data);
+                final Message msg=new Message(null, null, buf);
+                msg.putHeader(id, RelayHeader.create(RelayHeader.Type.VIEW));
+                if(use_seperate_thread) {
+                    timer.execute(new Runnable() {
+                        public void run() {
+                            try {
+                                bridge2.send(msg);
+                            }
+                            catch(Exception e) {
+                                log.error("failed sending view to remote2", e);
+                            }
+                        }
+                    });
+                }
+                else
+                    bridge2.send(msg);
+            }
+        }
+        catch(Exception e) {
+            log.error("failed sending view to remote2", e);
+        }
     }
 
 
@@ -410,6 +452,19 @@ public class MULTIRELAY extends Protocol {
         }
         catch(ChannelException e) {
             log.error("failed creating bridge channel (props=" + bridge_props + ")", e);
+        }
+
+        try {
+            if(log.isTraceEnabled())
+                log.trace("I'm the coordinator, creating a channel2 (props=" + bridge_props2 + ", cluster_name=" + bridge_name2 + ")");
+            bridge2=new JChannel(bridge_props2);
+            bridge2.setOpt(Channel.LOCAL, false); // don't receive my own messages
+            bridge2.setReceiver(new Receiver());
+            bridge2.connect(bridge_name2);
+
+        }
+        catch(ChannelException e) {
+            log.error("failed creating bridge channel2 (props=" + bridge_props2 + ")", e);
         }
     }
 
@@ -500,12 +555,19 @@ public class MULTIRELAY extends Protocol {
         if(remote_view_fetcher_future == null || remote_view_fetcher_future.isDone()) {
             remote_view_fetcher_future=timer.scheduleWithFixedDelay(new RemoteViewFetcher(), 500, 2000, TimeUnit.MILLISECONDS);
         }
+        if(remote_view_fetcher_future2 == null || remote_view_fetcher_future2.isDone()) {
+            remote_view_fetcher_future2=timer.scheduleWithFixedDelay(new RemoteViewFetcher2(), 500, 2000, TimeUnit.MILLISECONDS);
+        }
     }
 
     protected synchronized void stopRemoteViewFetcher() {
         if(remote_view_fetcher_future != null) {
             remote_view_fetcher_future.cancel(false);
             remote_view_fetcher_future=null;
+        }
+        if(remote_view_fetcher_future2 != null) {
+            remote_view_fetcher_future2.cancel(false);
+            remote_view_fetcher_future2=null;
         }
     }
 
@@ -516,6 +578,8 @@ public class MULTIRELAY extends Protocol {
         public void receive(Message msg) {
             Address sender=msg.getSrc();
             if(bridge.getAddress().equals(sender)) // discard my own messages
+                return;
+            if(bridge2.getAddress().equals(sender)) // discard my own messages
                 return;
 
             RelayHeader hdr=(RelayHeader)msg.getHeader(id);
@@ -590,6 +654,21 @@ public class MULTIRELAY extends Protocol {
             msg.putHeader(id, RelayHeader.create(MULTIRELAY.RelayHeader.Type.BROADCAST_VIEW));
             try {
                 bridge.send(msg);
+            }
+            catch(Exception e) {
+            }
+        }
+    }
+
+    protected class RemoteViewFetcher2 implements Runnable {
+
+        public void run() {
+            if(bridge2 == null || !bridge2.isConnected() || remote_view != null)
+                return;
+            Message msg=new Message();
+            msg.putHeader(id, RelayHeader.create(MULTIRELAY.RelayHeader.Type.BROADCAST_VIEW));
+            try {
+                bridge2.send(msg);
             }
             catch(Exception e) {
             }
